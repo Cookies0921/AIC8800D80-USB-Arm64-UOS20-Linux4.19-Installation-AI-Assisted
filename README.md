@@ -1,8 +1,8 @@
-# AIC8800D80 USB Wi-Fi 在 ARM64 + UOS 20 + Linux 4.19 上的驱动安装与适配记录
+# AIC8800D80 USB Wi-Fi 在 ARM64 + UOS 20 + Linux 4.19 上的驱动安装记录
 
-> 本文记录一次在 **ARM64 + UOS 20 + Linux 4.19** 环境下，为 **AIC8800D80 USB Wi-Fi 网卡**安装 Linux 驱动的完整排障过程。
+> 本文记录一次在 **ARM64 + UOS 20 + Linux 4.19** 环境下，为 **AIC8800D80 USB Wi-Fi 网卡**完成驱动安装、编译、加载与验证的实际过程。
 >
-> 核心路线：**USB 设备识别 → 驱动源码 → Linux 4.19 兼容 → ARM64 编译 → 内核模块 → 固件 → WLAN 接口 → Wi-Fi 扫描**。
+> 核心路线：**USB 模式识别 → 下载驱动源码 → ARM64 / Linux 4.19 编译 → 安装 Firmware / Kernel Module → 加载驱动 → `dmesg` 检查 → WLAN 接口验证 → Wi-Fi 扫描**。
 
 ## 1. 测试环境
 
@@ -52,21 +52,21 @@ AIC8800D80 插入 USB 后，并不意味着系统已经具备完整的 Wi-Fi 驱
 ```text
 USB 设备识别
       ↓
-设备进入正确工作状态
+USB 工作模式 / 枚举状态
       ↓
-Linux 驱动源码
+下载驱动源码
       ↓
 ARM64 编译
       ↓
 Linux 4.19 Kernel API 兼容
       ↓
-生成 .ko
-      ↓
-加载 Kernel Module
-      ↓
 Firmware
       ↓
-创建 wlan 接口
+Kernel Module
+      ↓
+加载驱动
+      ↓
+创建 WLAN 接口
       ↓
 扫描 Wi-Fi
 ```
@@ -91,24 +91,22 @@ Firmware
 lsusb
 ```
 
-确认 Linux USB 子系统能够发现设备。
-
-查看内核日志：
+查看 USB 枚举日志：
 
 ```bash
-dmesg | tail -n 100
+sudo dmesg | tail -n 100
 ```
 
-或者：
+筛选 USB：
 
 ```bash
-dmesg | grep -i usb
+sudo dmesg | grep -i usb
 ```
 
-进一步过滤 AIC8800：
+筛选 AIC8800：
 
 ```bash
-dmesg | grep -Ei 'aic|8800'
+sudo dmesg | grep -Ei 'aic|8800'
 ```
 
 这一阶段主要回答：
@@ -157,14 +155,14 @@ wlan0
 
 具体接口名可能不同。
 
-正确的判断流程应为：
+正确判断流程：
 
 ```text
 lsusb
   ↓
 USB 设备存在
   ↓
-驱动加载
+驱动 / Firmware 初始化
   ↓
 iw dev
   ↓
@@ -178,14 +176,12 @@ iw dev
 搜索当前 Kernel 的模块目录：
 
 ```bash
-find /lib/modules/$(uname -r) -type f \\
-  \( -iname '*aic*' -o -iname '*8800*' \) \\
+find /lib/modules/$(uname -r) -type f \
+  \( -iname '*aic*' -o -iname '*8800*' \) \
   2>/dev/null
 ```
 
-这一步用于判断当前 UOS 内核是否已经包含可直接使用的 AIC8800/AIC8800D80 驱动。
-
-本次环境没有发现可以直接使用的 AIC8800D80 Wi-Fi 驱动模块，因此没有继续走“直接加载系统已有驱动”的路线，而是采用源码编译。
+本次环境没有发现可以直接用于 AIC8800D80 Wi-Fi 的现成驱动模块，因此采用源码编译方式。
 
 ---
 
@@ -228,51 +224,96 @@ ARM64 + Linux 4.19
 
 ---
 
-## 7. 第三步：准备 AIC8800 驱动源码
+## 7. 第三步：下载 AIC8800D80 驱动源码
 
-假设驱动源码放在：
+本次使用的开源驱动仓库：
 
 ```text
-~/aic8800d80/
+https://github.com/shenmintao/aic8800d80
 ```
 
-进入驱动目录：
+下载：
 
 ```bash
-cd ~/aic8800d80/drivers/aic8800
+git clone https://github.com/shenmintao/aic8800d80.git
 ```
 
-查看源码：
+进入源码目录：
 
 ```bash
-ls
+cd ~/aic8800d80
 ```
 
-检查 Makefile：
+查看目录：
 
 ```bash
-ls -l Makefile
+ls -lah
 ```
+
+本仓库包含：
+
+```text
+drivers/aic8800   # Wi-Fi Kernel Driver
+fw/               # Firmware
+usb_modeswitch/   # USB 模式切换配置
+```
+
+> **复现建议：** 本 README 记录的是一次成功的 UOS 20 / Linux 4.19 实际环境。由于驱动仓库会继续更新，后续复现时最好记录当时使用的 Git commit，并优先使用与成功环境相同的源码版本，而不是默认使用仓库最新版本。
 
 ---
 
-## 8. 第四步：检查 Linux Kernel Build 环境
+## 8. 第四步：检查 USB 模式 / 模式切换
 
-首先：
+部分 AIC8800D80 USB 设备上电后会先以 USB 存储 / 虚拟光驱形式出现，然后再切换到无线设备工作模式。
+
+首先观察：
+
+```bash
+lsusb
+```
+
+并查看：
+
+```bash
+sudo dmesg | grep -Ei 'usb|aic|8800|storage|scsi'
+```
+
+本仓库提供了 `usb_modeswitch` 相关配置，可用于持久化模式切换：
+
+```bash
+cd ~/aic8800d80
+
+sudo cp usb_modeswitch/1111:1111 \
+  /etc/usb_modeswitch.d/
+```
+
+如果仓库实际提供的文件名或目录结构与当前版本不同，应以对应版本仓库内容为准。
+
+重新插拔设备后再次检查：
+
+```bash
+lsusb
+```
+
+如果设备从初始 USB 存储模式重新枚举为 AIC8800 的工作模式，说明模式切换环节已经完成。
+
+---
+
+## 9. 第五步：准备 Linux Kernel Build 环境
+
+检查模块目录：
 
 ```bash
 ls -ld /lib/modules/$(uname -r)
 ```
 
-然后：
+检查 Kernel Build：
 
 ```bash
 ls -ld /lib/modules/$(uname -r)/build
 ```
 
-对于 Linux Kernel Module 编译来说，需要有和当前运行 Kernel 对应的构建环境。
-
-同时检查编译工具：
+检查编译工具：
 
 ```bash
 gcc --version
@@ -302,13 +343,63 @@ AIC8800 Driver Source
 
 ---
 
-## 9. 第五步：开始编译
+## 10. 第六步：准备 Firmware 和 udev 规则
 
 进入源码目录：
 
 ```bash
+cd ~/aic8800d80
+```
+
+仓库提供 Firmware：
+
+```bash
+ls -lah fw
+```
+
+按照本次驱动仓库的手动安装方式，可以复制 AIC8800 Firmware：
+
+```bash
+sudo cp -r ./fw/aic8800* /lib/firmware/
+```
+
+复制 udev 规则：
+
+```bash
+sudo cp aic.rules /usr/lib/udev/rules.d/
+```
+
+然后可以重新加载 udev 规则：
+
+```bash
+sudo udevadm control --reload-rules
+```
+
+> **注意：** Firmware 必须与驱动源码版本和硬件版本匹配。仓库作者明确提醒，使用错误的 AIC8800 Firmware 版本可能导致设备初始化异常甚至系统冻结，因此不建议随意混用其他版本的 Firmware。
+
+---
+
+## 11. 第七步：进入驱动源码
+
+```bash
 cd ~/aic8800d80/drivers/aic8800
 ```
+
+查看源码：
+
+```bash
+ls -lah
+```
+
+检查 Makefile：
+
+```bash
+ls -l Makefile
+```
+
+---
+
+## 12. 第八步：开始编译
 
 执行：
 
@@ -316,11 +407,14 @@ cd ~/aic8800d80/drivers/aic8800
 make
 ```
 
-如果驱动源码的 Makefile 正确配置，它会调用 Linux Kernel 的构建系统编译内核模块。
+如果此前已经编译过，需要清理后重新编译：
 
-### 第一次编译出错怎么办？
+```bash
+make clean
+make
+```
 
-不要立即得出“ARM64 不支持”的结论。
+如果编译过程中报错，不要立即得出“ARM64 不支持”的结论。
 
 更常见的原因是：
 
@@ -332,11 +426,11 @@ Linux Kernel 版本
 
 之间存在 API 差异。
 
-尤其目标环境为 Linux 4.19，而不少驱动源码是在更高版本 Kernel 环境下维护或验证的。
+尤其目标环境为 Linux 4.19，而当前开源仓库的公开测试信息主要集中在更高版本 Kernel，因此 Linux 4.19 需要特别关注源码兼容性。本次成功实践的价值就在于验证了目标环境下的实际编译路径，而不是假设所有 Kernel 都天然兼容。
 
 ---
 
-## 10. Linux 4.19 是这次最大的兼容性难点
+## 13. Linux 4.19 是这次最大的兼容性难点
 
 ARM64 并不是这里最困难的因素。
 
@@ -382,7 +476,7 @@ Linux 4.19
 
 ---
 
-## 11. 编译完成后检查 `.ko`
+## 14. 第九步：检查生成的 `.ko`
 
 不要只看 `make` 是否返回成功。
 
@@ -415,7 +509,7 @@ vermagic
 vermagic
 ```
 
-以及当前 Kernel：
+以及：
 
 ```bash
 uname -r
@@ -429,107 +523,93 @@ uname -r
 
 ---
 
-## 12. 第六步：安装 `.ko`
+## 15. 第十步：安装驱动
 
-把编译出的模块放入当前 Kernel 的模块目录，例如：
+本次源码仓库提供了直接安装方式：
 
 ```bash
-sudo cp xxx.ko \\
-  /lib/modules/$(uname -r)/kernel/drivers/net/wireless/
+sudo make install
 ```
 
-更新依赖：
+如果需要完整重编译：
+
+```bash
+make clean
+make
+sudo make install
+```
+
+安装完成后更新模块依赖：
 
 ```bash
 sudo depmod -a
 ```
 
-加载模块：
+查看安装后的 AIC8800 模块：
 
 ```bash
-sudo modprobe <模块名>
-```
-
-### 不要盲猜模块名
-
-不要默认：
-
-```bash
-modprobe aic8800
-```
-
-因为：
-
-```text
-源码目录名
-≠
-.ko 文件名
-≠
-modprobe 模块名
-```
-
-应该以实际生成的 `.ko` 和 `modinfo` 信息为准。
-
----
-
-## 13. 第七步：检查驱动是否成功加载
-
-```bash
-lsmod | grep -Ei 'aic|8800'
-```
-
-查看初始化日志：
-
-```bash
-dmesg | grep -Ei 'aic|8800'
-```
-
-同时检查 Firmware：
-
-```bash
-dmesg | grep -Ei 'firmware|wlan'
-```
-
-这一阶段主要判断：
-
-```text
-Kernel Module
-        ↓
-是否真的被 Kernel 接受
-        ↓
-驱动初始化
-        ↓
-Firmware 加载
+find /lib/modules/$(uname -r) -type f \
+  | grep -Ei 'aic|8800'
 ```
 
 ---
 
-## 14. Firmware 是另一个关键点
+## 16. 第十一步：加载 AIC8800 驱动
 
-即使：
+本仓库 Wi-Fi 驱动模块名为：
 
-```bash
-make
+```text
+aic8800_fdrv
 ```
 
-成功，且：
+加载：
 
 ```bash
-modprobe <模块名>
+sudo modprobe aic8800_fdrv
 ```
 
-没有明显报错，也不代表 Wi-Fi 一定能工作。
+检查：
 
-检查固件：
+```bash
+lsmod | grep aic
+```
+
+预期可以看到类似：
+
+```text
+aic8800_fdrv
+cfg80211
+ aic_load_fw
+```
+
+具体模块数量和依赖关系以当前 Kernel 为准。
+
+---
+
+## 17. 第十二步：检查 Firmware / 驱动初始化日志
+
+检查 AIC8800：
+
+```bash
+sudo dmesg | grep -Ei 'aic|8800'
+```
+
+检查 Firmware：
+
+```bash
+sudo dmesg | grep -Ei 'firmware'
+```
+
+综合检查：
+
+```bash
+sudo dmesg | grep -Ei 'aic|8800|firmware|wlan|cfg80211'
+```
+
+检查系统中的 Firmware：
 
 ```bash
 find /lib/firmware -type f | grep -Ei 'aic|8800'
-```
-
-再看日志：
-
-```bash
-dmesg | grep -Ei 'firmware|aic|8800'
 ```
 
 如果出现类似：
@@ -538,13 +618,13 @@ dmesg | grep -Ei 'firmware|aic|8800'
 failed to load firmware
 ```
 
-此时重点应该转向 Firmware，而不是继续修改 `.ko`。
+那么下一步应该优先检查 Firmware 版本、路径和权限，而不是继续修改 `.ko`。
 
 ---
 
-## 15. 第八步：确认 WLAN 接口
+## 18. 第十三步：确认 WLAN 接口
 
-检查网络接口：
+检查所有网络接口：
 
 ```bash
 ip link
@@ -556,17 +636,17 @@ ip link
 iw dev
 ```
 
-如果出现无线接口，例如：
+如果出现：
 
 ```text
 wlan0
 ```
 
-说明驱动已经完成从 USB 到 WLAN 的关键初始化。
+或其他无线接口名，则说明驱动已经完成从 USB 到 WLAN 的关键初始化。
 
 ---
 
-## 16. 第九步：实际扫描 Wi-Fi
+## 19. 第十四步：实际扫描 Wi-Fi
 
 以 `wlan0` 为例：
 
@@ -574,7 +654,7 @@ wlan0
 sudo iw dev wlan0 scan | head -n 50
 ```
 
-如果能够扫描到附近 AP，并看到：
+如果能够看到附近 AP 的：
 
 ```text
 SSID
@@ -589,7 +669,7 @@ frequency
 
 ---
 
-## 17. 最终验证流程
+## 20. 最终验证流程
 
 推荐完整执行：
 
@@ -607,7 +687,7 @@ lsusb
 lsmod | grep -Ei 'aic|8800'
 
 # 驱动 / Firmware 日志
-dmesg | grep -Ei 'aic|8800|firmware|wlan'
+sudo dmesg | grep -Ei 'aic|8800|firmware|wlan'
 
 # 网络接口
 ip link
@@ -616,7 +696,7 @@ ip link
 iw dev
 ```
 
-最终的判断逻辑：
+最终判断逻辑：
 
 ```text
 ┌──────────────────────┐
@@ -651,7 +731,7 @@ iw dev
 
 ---
 
-## 18. 一套可复用的排障命令
+## 21. 一套可复用的排障命令
 
 以后遇到类似国产 USB Wi-Fi，可以直接按照下面流程检查：
 
@@ -666,56 +746,66 @@ uname -r
 lsusb
 
 # 4. 内核日志
-dmesg | tail -n 100
-dmesg | grep -Ei 'usb|aic|8800|wlan|firmware'
+sudo dmesg | tail -n 100
+sudo dmesg | grep -Ei 'usb|aic|8800|wlan|firmware'
 
 # 5. 搜索系统已有驱动
-find /lib/modules/$(uname -r) -type f \\
-  \( -iname '*aic*' -o -iname '*8800*' \) \\
+find /lib/modules/$(uname -r) -type f \
+  \( -iname '*aic*' -o -iname '*8800*' \) \
   2>/dev/null
 
 # 6. 检查 Kernel Build
 ls -ld /lib/modules/$(uname -r)/build
 
-# 7. 进入源码
+# 7. 下载源码（首次安装）
+git clone https://github.com/shenmintao/aic8800d80.git ~/aic8800d80
+
+# 8. 进入源码
+cd ~/aic8800d80
+
+# 9. Firmware / udev
+sudo cp -r ./fw/aic8800* /lib/firmware/
+sudo cp aic.rules /usr/lib/udev/rules.d/
+sudo udevadm control --reload-rules
+
+# 10. 进入驱动目录
 cd ~/aic8800d80/drivers/aic8800
 
-# 8. 编译
+# 11. 编译
 make
 
-# 9. 查找内核模块
+# 12. 查找内核模块
 find . -name "*.ko"
 
-# 10. 查看模块信息
+# 13. 查看模块信息
 modinfo ./xxx.ko
 
-# 11. 安装模块
-sudo cp xxx.ko \\
-  /lib/modules/$(uname -r)/kernel/drivers/net/wireless/
+# 14. 安装
+sudo make install
 
-# 12. 更新模块依赖
+# 15. 更新模块依赖
 sudo depmod -a
 
-# 13. 加载驱动
-sudo modprobe <模块名>
+# 16. 加载驱动
+sudo modprobe aic8800_fdrv
 
-# 14. 查看模块
-lsmod | grep -Ei 'aic|8800'
+# 17. 查看模块
+lsmod | grep aic
 
-# 15. 检查 Firmware
-find /lib/firmware -type f | grep -Ei 'aic|8800'
+# 18. 检查 Firmware / 驱动日志
+sudo dmesg | grep -Ei 'aic|8800|firmware|wlan|cfg80211'
 
-# 16. 检查 WLAN
+# 19. 检查 WLAN
 ip link
 iw dev
 
-# 17. 扫描 Wi-Fi
+# 20. 扫描 Wi-Fi
 sudo iw dev wlan0 scan
 ```
 
 ---
 
-## 19. 这次最值得记录的经验
+## 22. 这次最值得记录的经验
 
 ### 经验 1：不要把“USB 识别”当成“驱动成功”
 
@@ -745,7 +835,7 @@ Wi-Fi Scan
 
 > **AIC8800D80 并不是因为 ARM64 就无法使用。**
 
-如果存在 Linux 驱动源码，通常可以尝试：
+如果存在 Linux 驱动源码，可以尝试：
 
 ```text
 Source Code
@@ -793,12 +883,14 @@ Linux 4.19
 
 ---
 
-## 20. 本次成功的核心方法
+## 23. 本次成功的核心方法
 
 ```text
 确认硬件
    ↓
 确认 USB
+   ↓
+确认 USB 模式 / 枚举状态
    ↓
 确认 ARM64
    ↓
@@ -806,13 +898,13 @@ Linux 4.19
    ↓
 确认没有现成驱动
    ↓
-获取 AIC8800 驱动源码
+下载 AIC8800 驱动源码
+   ↓
+准备 Firmware / udev
    ↓
 准备 Kernel Build 环境
    ↓
 本机编译
-   ↓
-解决 Kernel 兼容问题
    ↓
 生成 .ko
    ↓
@@ -821,8 +913,6 @@ Linux 4.19
 depmod
    ↓
 modprobe
-   ↓
-准备 Firmware
    ↓
 检查 dmesg
    ↓
@@ -833,7 +923,7 @@ iw dev
 
 ---
 
-## 21. 总结
+## 24. 总结
 
 本次 AIC8800D80 USB Wi-Fi 驱动安装，验证了一条比较通用的国产 ARM Linux 外设驱动路线：
 
@@ -848,9 +938,9 @@ iw dev
         ↓
 在目标平台重新编译
         ↓
-安装 Kernel Module
-        ↓
 安装 Firmware
+        ↓
+安装 Kernel Module
         ↓
 逐级验证 USB / Kernel / WLAN
 ```
@@ -873,7 +963,7 @@ make 没报错
 
 ---
 
-## 22. 结论
+## 25. 结论
 
 **AIC8800D80 + ARM64 + UOS 20 + Linux 4.19 并不是一个无法解决的组合。**
 
@@ -881,6 +971,8 @@ make 没报错
 
 ```text
 硬件识别
++
+USB 模式
 +
 驱动源码
 +
@@ -899,7 +991,7 @@ Firmware
 
 ---
 
-## 23. 环境信息
+## 26. 环境信息
 
 ```text
 OS:       UOS 20
@@ -909,4 +1001,31 @@ Device:   AIC8800D80
 Bus:      USB
 ```
 
-> **注意：** 本文中的命令以本次排障过程为基础整理。具体 `.ko` 文件名、Firmware 文件名、模块名以及部分编译参数，应以你实际使用的 AIC8800 驱动源码版本为准。
+---
+
+## 27. 参考 / 致谢
+
+本次终端安装流程中实际使用到的核心开源驱动仓库：
+
+### [shenmintao/aic8800d80](https://github.com/shenmintao/aic8800d80)
+
+感谢 **shenmintao** 以及相关开源贡献者提供 AIC8800D80 Linux 驱动源码及配套安装资源。
+
+本次实际安装过程中涉及的仓库内容包括：
+
+- `drivers/aic8800/`：AIC8800 Wi-Fi Kernel Driver 源码
+- `fw/`：AIC8800 Firmware
+- `aic.rules`：udev 规则
+- `usb_modeswitch/`：USB 模式切换配置
+
+本 README 中的下载、编译、安装、Firmware 部署、USB 模式处理以及驱动验证命令，均围绕上述仓库源码整理，并结合本次 **ARM64 + UOS 20 + Linux 4.19** 实际环境进行记录。
+
+> 说明：上游仓库会持续更新，当前仓库的公开测试环境与本次 Linux 4.19 环境并不相同。因此，本 README 不宣称“仓库当前最新版必然兼容 Linux 4.19”，而是记录本次实际成功安装过程。为了复现本次结果，建议同时保留当时使用的 Git commit / 源码版本。
+
+---
+
+## License
+
+本文主要用于记录个人实际驱动安装与排障过程。
+
+AIC8800 驱动源码、Firmware、udev 规则及其他第三方代码的版权和许可证以其原始仓库为准，请遵循对应项目的 License 和版权声明。
